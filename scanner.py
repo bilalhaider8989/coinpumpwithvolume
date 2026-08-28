@@ -67,20 +67,20 @@ CONFIG = {
 
         # 15-minute spike: the fire candle vs its own recent baseline.
         # Primary signal - matches your scan cadence, hardest bar to clear.
-        "lookback_15m": 20,       # candles used to build the baseline
-        "multiplier_15m": 1.5,    # fire candle's volume must be >= this x baseline
+        "lookback_15m": 10,       # candles used to build the baseline
+        "multiplier_15m": 1.2,    # fire candle's volume must be >= this x baseline
 
         # 1-hour spike: sum of the last ~1h of candles vs the same-sized
         # window before it. Secondary confirmation - easier bar to clear,
         # so it has less influence than the 15m check.
-        "lookback_1h": 20,        # prior 1h windows averaged for the baseline
+        "lookback_1h": 10,        # prior 1h windows averaged for the baseline
         "multiplier_1h": 1.2,
 
         # 24h USDT liquidity floor - a hard minimum, not a spike check.
         # Fetched once per run for every symbol (1 API call, not per-symbol)
         # and applied BEFORE candles are even fetched, so illiquid pairs
         # never reach the signal logic at all.
-        "min_24h_volume_usdt": 5_000_000,
+        "min_24h_volume_usdt": 3_000_000,
     },
 
     # ---- Squeeze (MA9/20 cross only) ----
@@ -88,7 +88,7 @@ CONFIG = {
     # for `lookback` candles right before the cross. Shown in the Discord
     # message ("squeeze=yes/no") but never blocks the alert.
     "squeeze": {
-        "enabled": False,
+        "enabled": True,
         "lookback": 10,       # candles checked immediately before the cross
         "max_pct": 0.15,      # MA9/MA20 gap must stay <= this the whole window
     },
