@@ -2,6 +2,11 @@
 Free Binance scanner - configurable DEMA200 + SuperTrend + MA9/20 cross,
 with Discord notifications. Designed to run on a schedule via GitHub
 Actions, so it works even when your own laptop is off.
+
+Optional add-on: "scalp_mode" - a separate 5m early-scalp radar
+(volume spike + green candle + DEMA200 trend + SuperTrend bullish),
+toggled independently via CONFIG["scalp_mode"]["enabled"]. It does not
+touch or depend on the original DEMA/MA-cross logic in any way.
 """
 
 import json
@@ -93,6 +98,37 @@ CONFIG = {
         "max_pct": 0.15,      # MA9/MA20 gap must stay <= this the whole window
     },
 
+    # ---- SCALP MODE (new, independent layer) ----
+    # Master switch: when False, this entire block is skipped and the
+    # script behaves EXACTLY as before. When True, it runs as a separate
+    # pass after the main scan and posts its own Discord message - it does
+    # not read or write ma_armed/dema_trade_taken state at all.
+    #
+    # Goal: catch early scalps by ranking symbols on 5m volume spike, but
+    # ONLY among candidates that also show a green candle / price-up move
+    # AND are still trending (above DEMA200, SuperTrend bullish) - same
+    # trend filter as your main DEMA signal, just applied on 5m candles.
+    "scalp_mode": {
+        "enabled": True,        # <-- flip this on/off
+
+        "interval": "5m",
+        "candle_limit": 500,     # needs >= dema_length*2 candles of history
+        "top_n": 5,              # only the top N ranked candidates get posted
+
+        # 5m volume spike: fire candle vs its own recent baseline
+        "vol_lookback": 6,
+        "vol_multiplier": 1.5,
+
+        # Price confirmation: candle must close green, and move at least
+        # this much (0.0 = any green candle qualifies)
+        "min_price_change_pct": 0.0,
+
+        # Trend filter, same idea as the main DEMA200+SuperTrend signal,
+        # computed on 5m candles. Reuses CONFIG["supertrend"] params.
+        "dema_length": 200,
+        "dema_min_pct_above": 0.3,
+    },
+
     # ---- 5. Discord notifications (free, no bot needed) ----
     "discord_webhook_url": os.environ.get("DISCORD_WEBHOOK_URL", ""),
 }
@@ -130,13 +166,16 @@ def get_24h_volumes() -> dict[str, float]:
     return {d["symbol"]: float(d["quoteVolume"]) for d in r.json()}
 
 
-def get_klines(symbol: str) -> pd.DataFrame:
+def get_klines(symbol: str, interval: str | None = None, limit: int | None = None) -> pd.DataFrame:
+    """interval/limit default to CONFIG["interval"]/CONFIG["candle_limit"]
+    so all existing call sites behave exactly as before. Scalp mode passes
+    its own interval/limit explicitly."""
     r = requests.get(
         f"{BINANCE_BASE}/api/v3/klines",
         params={
             "symbol": symbol,
-            "interval": CONFIG["interval"],
-            "limit": CONFIG["candle_limit"],
+            "interval": interval or CONFIG["interval"],
+            "limit": limit or CONFIG["candle_limit"],
         },
         timeout=15,
     )
@@ -185,7 +224,7 @@ def send_discord(message: str) -> None:
 
 
 # ============================================================
-# Per-symbol evaluation
+# Per-symbol evaluation (ORIGINAL - unchanged)
 # ============================================================
 
 def check_symbol(symbol: str, state: dict, volume_24h: dict | None = None) -> list[dict]:
@@ -329,6 +368,95 @@ def check_symbol(symbol: str, state: dict, volume_24h: dict | None = None) -> li
 
 
 # ============================================================
+# SCALP MODE (new, independent - no shared state with check_symbol)
+# ============================================================
+
+def check_symbol_scalp(symbol: str) -> dict | None:
+    """Snapshot-style check for the 5m scalp radar. No armed/fired state
+    across runs on purpose - this is meant to surface *current* early
+    movers each run, then get ranked and trimmed to top_n in run_scan().
+    Returns a candidate dict, or None if it fails any filter."""
+    cfg = CONFIG["scalp_mode"]
+
+    min_history = max(cfg["dema_length"] * 2, cfg["vol_lookback"] + 1, 50)
+    df = get_klines(symbol, interval=cfg["interval"], limit=max(cfg["candle_limit"], min_history + 5))
+    if len(df) < min_history:
+        return None
+
+    df = df.iloc[:-1]  # drop the still-forming candle
+    close = df["close"]
+    open_ = df["open"]
+    vol = df["volume"]
+
+    # -- 5m volume spike: fire candle vs its own recent baseline --
+    baseline = vol.iloc[-(cfg["vol_lookback"] + 1):-1].mean()
+    ratio = (vol.iloc[-1] / baseline) if baseline > 0 else 0.0
+    if ratio < cfg["vol_multiplier"]:
+        return None
+
+    # -- green candle / price up % --
+    last_open, last_close = open_.iloc[-1], close.iloc[-1]
+    change_pct = (last_close - last_open) / last_open * 100
+    if not (last_close > last_open and change_pct >= cfg["min_price_change_pct"]):
+        return None
+
+    # -- DEMA200 trend filter (5m) --
+    dema_val = dema(close, cfg["dema_length"])
+    last_dema = dema_val.iloc[-1]
+    dema_pct = (last_close - last_dema) / last_dema * 100
+    if dema_pct < cfg["dema_min_pct_above"]:
+        return None
+
+    # -- SuperTrend bullish (5m), same atr/multiplier as main config --
+    st = supertrend(df, CONFIG["supertrend"]["atr_length"], CONFIG["supertrend"]["multiplier"])
+    if not (st["direction"].iloc[-1] < 0):
+        return None
+
+    return {
+        "symbol": symbol,
+        "price": last_close,
+        "ratio": ratio,
+        "change_pct": change_pct,
+        "dema_pct": dema_pct,
+    }
+
+
+def run_scalp_scan(symbols: list[str]) -> None:
+    cfg = CONFIG["scalp_mode"]
+    print(f"\nScalp mode: scanning {len(symbols)} pairs on {cfg['interval']}...")
+
+    candidates = []
+    for i, symbol in enumerate(symbols, 1):
+        try:
+            hit = check_symbol_scalp(symbol)
+            if hit:
+                candidates.append(hit)
+        except Exception as e:
+            print(f"  {symbol}: scalp skipped ({e})")
+        time.sleep(CONFIG["request_sleep"])
+
+        if i % 50 == 0:
+            print(f"  ...{i}/{len(symbols)} scalp-scanned")
+
+    candidates.sort(key=lambda c: c["ratio"], reverse=True)
+    top = candidates[: cfg["top_n"]]
+
+    if not top:
+        print("  No scalp setups this run.")
+        return
+
+    lines = [f"🚀 **Scalp Setup** (5m vol+price+DEMA200+SuperTrend) - top {len(top)}"]
+    for c in top:
+        lines.append(
+            f"{c['symbol']} @ {c['price']} - vol5m={c['ratio']:.2f}x, "
+            f"chg={c['change_pct']:.2f}%, DEMA200 +{c['dema_pct']:.2f}%"
+        )
+    msg = "\n".join(lines)
+    print(msg)
+    send_discord(msg)
+
+
+# ============================================================
 # Main scan loop
 # ============================================================
 
@@ -368,6 +496,10 @@ def run_scan() -> None:
 
     save_state(state)
     print(f"\nDone. {len(all_hits)} fresh signal(s) found.")
+
+    # ---- Scalp mode: fully separate pass, only runs if switched on ----
+    if CONFIG["scalp_mode"]["enabled"]:
+        run_scalp_scan(symbols)
 
 
 if __name__ == "__main__":
