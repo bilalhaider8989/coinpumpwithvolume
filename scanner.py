@@ -58,12 +58,29 @@ CONFIG = {
     },
 
     # ---- Volume spike (MA9/20 cross only) ----
-    # REQUIRED when enabled: if the fire candle doesn't have a volume spike,
-    # the alert is suppressed entirely (not just noted in the message).
+    # All three are REQUIRED when enabled: any one failing suppresses the
+    # alert entirely. "Weight" is expressed as strictness, not a blended
+    # score - the 15m multiplier is intentionally harder to clear than the
+    # 1h one, so it dominates without needing an opaque formula.
     "volume_spike": {
         "enabled": True,
-        "lookback": 10,       # candles used to build the average-volume baseline
-        "multiplier": 1.2,    # fire candle's volume must be >= multiplier x baseline
+
+        # 15-minute spike: the fire candle vs its own recent baseline.
+        # Primary signal - matches your scan cadence, hardest bar to clear.
+        "lookback_15m": 10,       # candles used to build the baseline
+        "multiplier_15m": 1.2,    # fire candle's volume must be >= this x baseline
+
+        # 1-hour spike: sum of the last ~1h of candles vs the same-sized
+        # window before it. Secondary confirmation - easier bar to clear,
+        # so it has less influence than the 15m check.
+        "lookback_1h": 10,        # prior 1h windows averaged for the baseline
+        "multiplier_1h": 1.2,
+
+        # 24h USDT liquidity floor - a hard minimum, not a spike check.
+        # Fetched once per run for every symbol (1 API call, not per-symbol)
+        # and applied BEFORE candles are even fetched, so illiquid pairs
+        # never reach the signal logic at all.
+        "min_24h_volume_usdt": 3_000_000,
     },
 
     # ---- Squeeze (MA9/20 cross only) ----
@@ -85,6 +102,13 @@ CONFIG = {
 # Binance data fetching
 # ============================================================
 
+def _interval_minutes(interval: str) -> int:
+    """'15m' -> 15, '1h' -> 60, '4h' -> 240, '1d' -> 1440."""
+    unit = interval[-1]
+    n = int(interval[:-1])
+    return {"m": n, "h": n * 60, "d": n * 1440}[unit]
+
+
 def get_usdt_symbols() -> list[str]:
     r = requests.get(f"{BINANCE_BASE}/api/v3/exchangeInfo", timeout=15)
     r.raise_for_status()
@@ -96,6 +120,14 @@ def get_usdt_symbols() -> list[str]:
         and s["status"] == "TRADING"
         and s["isSpotTradingAllowed"]
     ]
+
+
+def get_24h_volumes() -> dict[str, float]:
+    """One call for EVERY symbol's rolling 24h USDT volume - used as a
+    liquidity floor, not fetched per-symbol."""
+    r = requests.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", timeout=20)
+    r.raise_for_status()
+    return {d["symbol"]: float(d["quoteVolume"]) for d in r.json()}
 
 
 def get_klines(symbol: str) -> pd.DataFrame:
@@ -156,19 +188,23 @@ def send_discord(message: str) -> None:
 # Per-symbol evaluation
 # ============================================================
 
-def check_symbol(symbol: str, state: dict) -> list[dict]:
+def check_symbol(symbol: str, state: dict, volume_24h: dict | None = None) -> list[dict]:
     """Returns a list of hit dicts (can contain 0, 1, or 2 signals per symbol)."""
     dema_cfg = CONFIG["dema"]
     ma_cfg = CONFIG["ma_cross"]
     gap_cfg = CONFIG["ma_gap"]
     vol_cfg = CONFIG["volume_spike"]
     squeeze_cfg = CONFIG["squeeze"]
+    volume_24h = volume_24h or {}
+
+    candles_per_hour = max(1, 60 // _interval_minutes(CONFIG["interval"]))
 
     min_history = max(
         dema_cfg["length"] * 2 if dema_cfg["enabled"] else 0,
         ma_cfg["slow_length"] + gap_cfg["stdev_length"] if ma_cfg["enabled"] else 0,
         ma_cfg["slow_length"] + squeeze_cfg["lookback"] if ma_cfg["enabled"] and squeeze_cfg["enabled"] else 0,
-        vol_cfg["lookback"] + 1 if vol_cfg["enabled"] else 0,
+        vol_cfg["lookback_15m"] + 1 if vol_cfg["enabled"] else 0,
+        candles_per_hour * (vol_cfg["lookback_1h"] + 1) if vol_cfg["enabled"] else 0,
         50,
     )
 
@@ -251,13 +287,25 @@ def check_symbol(symbol: str, state: dict) -> list[dict]:
                 stdev = gap_series.rolling(gap_cfg["stdev_length"]).std().iloc[-1]
                 gap_ok = gap_raw >= (mean + gap_cfg["stdev_multiplier"] * stdev)
 
-            # Volume spike - REQUIRED when enabled (gates the alert, same as gap_ok)
-            vol_ratio = None
+            # Volume - REQUIRED when enabled: 15m spike (strict) AND 1h
+            # spike (looser) both have to clear their own bar. The 24h
+            # floor was already applied before this symbol was ever
+            # fetched, so it's looked up here only for display.
+            ratio_15m = ratio_1h = None
             if vol_cfg["enabled"]:
                 vol = df["volume"]
-                baseline = vol.iloc[-(vol_cfg["lookback"] + 1):-1].mean()
-                vol_ratio = (vol.iloc[-1] / baseline) if baseline > 0 else 0.0
-                volume_ok = vol_ratio >= vol_cfg["multiplier"]
+
+                baseline_15m = vol.iloc[-(vol_cfg["lookback_15m"] + 1):-1].mean()
+                ratio_15m = (vol.iloc[-1] / baseline_15m) if baseline_15m > 0 else 0.0
+                ok_15m = ratio_15m >= vol_cfg["multiplier_15m"]
+
+                hour_sums = vol.rolling(candles_per_hour).sum()
+                current_hour_vol = hour_sums.iloc[-1]
+                baseline_1h = hour_sums.iloc[-(vol_cfg["lookback_1h"] + 1):-1].mean()
+                ratio_1h = (current_hour_vol / baseline_1h) if baseline_1h and baseline_1h > 0 else 0.0
+                ok_1h = ratio_1h >= vol_cfg["multiplier_1h"]
+
+                volume_ok = ok_15m and ok_1h
             else:
                 volume_ok = True
 
@@ -265,7 +313,8 @@ def check_symbol(symbol: str, state: dict) -> list[dict]:
                 sym_state["ma_gap_fired"] = True
                 detail = f"gap={gap_pct:.3f}%"
                 if vol_cfg["enabled"]:
-                    detail += f", vol={vol_ratio:.2f}x avg"
+                    vol_24h_m = volume_24h.get(symbol, 0.0) / 1_000_000
+                    detail += f", vol15m={ratio_15m:.2f}x, vol1h={ratio_1h:.2f}x, vol24h={vol_24h_m:.1f}M"
                 if squeeze_cfg["enabled"]:
                     detail += f", squeeze={'yes' if sym_state.get('squeeze_ok') else 'no'}"
                 hits.append({
@@ -286,6 +335,17 @@ def check_symbol(symbol: str, state: dict) -> list[dict]:
 def run_scan() -> None:
     print(f"Fetching Binance {CONFIG['quote_asset']} pairs...")
     symbols = get_usdt_symbols()
+
+    volume_24h: dict[str, float] = {}
+    vol_cfg = CONFIG["volume_spike"]
+    if vol_cfg["enabled"]:
+        print("Fetching 24h volume for the liquidity floor (1 call, all symbols)...")
+        volume_24h = get_24h_volumes()
+        before = len(symbols)
+        symbols = [s for s in symbols if volume_24h.get(s, 0.0) >= vol_cfg["min_24h_volume_usdt"]]
+        floor_m = vol_cfg["min_24h_volume_usdt"] / 1_000_000
+        print(f"  {before} pairs -> {len(symbols)} pairs clear the {floor_m:.1f}M 24h floor")
+
     print(f"Scanning {len(symbols)} pairs on {CONFIG['interval']} timeframe...\n")
 
     state = load_state()
@@ -293,7 +353,7 @@ def run_scan() -> None:
 
     for i, symbol in enumerate(symbols, 1):
         try:
-            hits = check_symbol(symbol, state)
+            hits = check_symbol(symbol, state, volume_24h)
             for h in hits:
                 all_hits.append(h)
                 msg = f"[{h['type']}] {h['symbol']} @ {h['price']} ({h['detail']})"
